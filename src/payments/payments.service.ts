@@ -1,14 +1,18 @@
-import { Injectable } from '@nestjs/common'
-import { envs } from 'src/config'
+import { Inject, Injectable, Logger } from '@nestjs/common'
+import { envs, NATS_SERVICE } from 'src/config'
 import Stripe from 'stripe'
-import { PaymentSessionDto } from './dot/payment-session.dto'
+import { PaymentSessionDto } from './dto/payment-session.dto'
 import { Request, Response } from 'express'
+import { ClientProxy } from '@nestjs/microservices'
 
 @Injectable()
 export class PaymentsService {
 	private readonly stripe = new Stripe(envs.stripeSecret)
+	private readonly logger = new Logger('PaymentsService')
 
-	createPaymentSession(paymentSessionDto: PaymentSessionDto) {
+	constructor(@Inject(NATS_SERVICE) private readonly client: ClientProxy) {}
+
+	async createPaymentSession(paymentSessionDto: PaymentSessionDto) {
 		const { currency, items, orderId } = paymentSessionDto
 
 		const lineItems = items.map(item => {
@@ -24,7 +28,7 @@ export class PaymentsService {
 			}
 		})
 
-		return this.stripe.checkout.sessions.create({
+		const session = await this.stripe.checkout.sessions.create({
 			// Colocar el ID de la orden
 			payment_intent_data: {
 				metadata: {
@@ -36,9 +40,15 @@ export class PaymentsService {
 			success_url: envs.stripeSuccessUrl,
 			cancel_url: envs.stripeCancelUrl
 		})
+
+		return {
+			url: session.url,
+			successUrl: session.success_url,
+			cancelUrl: session.cancel_url
+		}
 	}
 
-	stripeWebook(req: Request, res: Response) {
+	stripeWebhook(req: Request, res: Response) {
 		// install stripe CLI
 		// https://docs.stripe.com/webhooks#local-listener
 
@@ -72,7 +82,13 @@ export class PaymentsService {
 		switch (event.type) {
 			case 'charge.succeeded':
 				const chargeSucceeded = event.data.object
-				console.log(chargeSucceeded.metadata)
+				const payload = {
+					stripePaymentId: chargeSucceeded.id,
+					orderId: chargeSucceeded.metadata.orderId,
+					receiptUrl: chargeSucceeded.receipt_url
+				}
+
+				this.client.emit('payment.succeeded', payload)
 				break
 			default:
 				console.log(`Event ${event.type} not handled`)
